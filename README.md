@@ -1,0 +1,254 @@
+# Docker aur Kubernetes — Food Delivery App se samjhein
+
+**Language / Bhasha:** [HINGLISH](README.md) · [TRANSLATE TO ENGLISH](README.en.md)
+
+> **Docker app ko consistent package karta hai; Kubernetes us app ki running copies ko machines par manage karta hai.**
+
+Is guide mein imaginary food-delivery company **QuickBite** ka example hai.
+
+## 1. “Mere laptop par chal raha hai” problem
+
+Developer Order Service Node.js 22 par banata hai. Production server par Node.js 18, ya dependencies/settings alag hain. Laptop par app chalti hai, server par fail ho jaati hai.
+
+```text
+Developer laptop                 Production server
+Node.js 22                       Node.js 18
+Dependency versions A            Dependency versions B
+App works                        App fails
+```
+
+Docker app ke runtime aur dependencies ko repeatable package mein rakhne mein madad karta hai. Isse local testing aur deployment ke environments zyada milte-julte hote hain.
+
+## 2. Docker: Dockerfile, Image, Container
+
+**Dockerfile** app banane ki recipe hai. Simplified example:
+
+```dockerfile
+FROM node:22-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+CMD ["node", "server.js"]
+```
+
+Dockerfile se **image** banti hai—app chalane ka packaged blueprint. Example tag: `quickbite/order-service:2.4.1`. Image ko registry mein store kiya ja sakta hai. Image start hone par uska running instance **container** kehlata hai.
+
+```text
+Dockerfile --build--> Image: order-service:2.4.1
+                           | run
+                           +--> local container
+                           +--> staging container
+                           +--> production container
+```
+
+### Image se deployment tak
+
+```mermaid
+flowchart LR
+    Code["QuickBite source code"] --> Build["Dockerfile se build"]
+    Build --> Image["Versioned Docker image"]
+    Image --> Registry["Image registry"]
+    Registry --> Dev["Developer laptop"]
+    Registry --> Stage["Staging"]
+    Registry --> Prod["Production: AWS, DigitalOcean, etc."]
+```
+
+**Step by step:** (1) Developer code badalta hai. (2) Dockerfile se image build hoti hai. (3) Image ko version tag milta hai. (4) Registry use store karti hai. (5) Compatible environments wahi image chala sakte hain. Isse har server par runtime/dependencies manually install karne ka kaam kam hota hai.
+
+**Accuracy note:** Docker image aam taur par poora alag operating-system kernel bundle nahi karti. Container host ka kernel share karta hai; image app aur runtime/dependencies package karti hai. Same image consistency badhati hai, lekin configuration, secrets, network, data aur hardware compatibility phir bhi matter karte hain. Passwords/API keys image mein bake nahi karne chahiye.
+
+## 3. Bahut containers hon toh Kubernetes kyun?
+
+QuickBite mein Order, Payment, Menu aur Tracking services ki kai copies alag machines par chalti hain. Copies, failures, capacity aur traffic manually sambhalna mushkil hai.
+
+**Kubernetes** containerized apps ko cluster mein deploy aur manage karta hai. Team desired state batati hai—jaise “Order Service ke 3 replicas”—aur Kubernetes usse maintain karne ki koshish karta hai.
+
+### Cluster ka overview
+
+**Control plane** decisions coordinate karta hai. **Worker Nodes** woh machines hain jahan app ke Pods chalte hain.
+
+```mermaid
+flowchart TB
+    Config["Team config: Order Service ke 3 replicas"] --> API["Kubernetes API"]
+    API --> Controller["Controller: desired vs actual state"]
+    Controller --> Scheduler["Scheduler: Pod ko Node par place kare"]
+    Scheduler --> N1["Worker Node 1: Order Pod, Menu Pod"]
+    Scheduler --> N2["Worker Node 2: Order Pod"]
+    Scheduler --> N3["Worker Node 3: Payment Pod"]
+```
+
+**Step by step:** Team config deti hai; control plane use record karta hai; controller actual Pods ko desired count se compare karta hai; scheduler available Nodes par Pods rakhta hai; worker machine ka container runtime image se container chalata hai. Managed Kubernetes mein cloud provider control plane ke kuch kaam sambhal sakta hai.
+
+## 4. Pod kya hai aur kyun hai?
+
+**Pod Kubernetes ki smallest deployable unit hai.** Aksar ek Pod mein ek main app container hota hai. Kabhi closely related helper container bhi saath hota hai. Ek Pod ke containers network aur selected storage context share kar sakte hain, isliye unhe saath schedule/manage kiya jaata hai.
+
+```mermaid
+flowchart LR
+    subgraph Pod["Order Service Pod"]
+      App["Main container: order API"]
+      Helper["Optional helper: logs/proxy"]
+      App --- Shared["Shared Pod network / selected storage"]
+      Helper --- Shared
+    end
+```
+
+Pod replace ho sakne wali running unit hai, permanent machine nahi. Pod fail ya replace ho sakta hai; naye Pod ka address alag ho sakta hai.
+
+## 5. Deployment, Service aur request ka raasta
+
+- **Pod:** app ki ek running copy.
+- **Deployment:** kitne matching Pods chahiye aur unhe kaise update karna hai.
+- **Service:** matching Pods tak requests pahunchane ka stable endpoint.
+- **Node:** worker machine jahan Pods chalte hain.
+
+```mermaid
+flowchart LR
+    Users["Customer apps"] --> LB["Cloud load balancer"]
+    LB --> Ingress["Ingress: HTTP routing, if configured"]
+    Ingress --> Service["Service: stable endpoint"]
+    Service --> P1["Order Pod 1"]
+    Service --> P2["Order Pod 2"]
+    Service --> P3["Order Pod 3"]
+    Deployment["Deployment: desired replicas 3"] -. "maintains" .-> P1
+    Deployment -.-> P2
+    Deployment -.-> P3
+```
+
+**Request ka raasta:** Customer request load balancer tak aati hai; configured Ingress use route kar sakta hai; Service available Order Pods mein bhejti hai. Deployment desired Pods maintain karta hai. Load balancer aur Ingress har cluster mein automatically configured nahi hote.
+
+## 6. Pod/container crash ho toh?
+
+```text
+Pehle:      Pod 1 | Pod 2 | Pod 3       (3 running)
+Crash:      Pod 1 | Pod 2 | failed      (2 healthy)
+Controller: desired 3, actual 2          (replacement ki koshish)
+Baad mein:  Pod 1 | Pod 2 | Pod 4       (3 running)
+```
+
+Deployment/controller replacement Pod create karwa sakta hai. Container process exit kare toh kubelet configured restart policy ke mutabik container restart kar sakta hai. Kubernetes bug fix nahi karta: agar har naya Pod usi bug se crash ho, service unavailable reh sakti hai. Recovery time startup aur capacity par depend karta hai.
+
+## 7. High traffic mein autoscaling kaise hoti hai?
+
+Lunch rush mein Order Service par load badhta hai. Team **Horizontal Pod Autoscaler (HPA)** configure kar sakti hai. HPA CPU jaise metrics ko configured target se compare karta hai.
+
+```mermaid
+flowchart TB
+    Traffic["Orders increase"] --> Load["Pods ka CPU/load rises"]
+    Load --> Metrics["Metrics system usage report"]
+    Metrics --> HPA["HPA target aur replica limits check"]
+    HPA -->|"Desired replicas: 3 se 6"| Dep["Deployment"]
+    Dep --> Sched["Scheduler Nodes par jagah dhoondhe"]
+    Sched --> NewPods["3 additional Pods"]
+    NewPods --> Svc["Service ready Pods ko traffic de"]
+```
+
+**Step by step:**
+
+1. Lunch rush se requests aur Pod load badhta hai.
+2. Metrics system CPU ya doosra configured metric report karta hai.
+3. HPA target se compare karke desired replicas badhata hai—maan lo 3 se 6.
+4. Deployment 3 Pods aur create karne ko kehta hai.
+5. Scheduler available Nodes par unhe place karta hai.
+6. Ready hone par Service naye Pods ko bhi traffic deti hai.
+7. Demand ghatne par configured rules aur limits ke mutabik replicas kam ho sakte hain.
+
+Autoscaling ko metrics, target, minimum/maximum replicas aur startup behavior ke saath configure karna hota hai; response instantaneous nahi hota.
+
+### Agar Nodes par jagah na ho?
+
+**Pod autoscaling** app copies badhata hai; **Node autoscaling** machines badhata hai. Yeh alag features hain.
+
+```text
+HPA: 6 Pods chahiye
+          |
+Scheduler existing Nodes par jagah dhoondhta hai
+      /                         \\
+Jagah hai                  Jagah nahi
+Pods schedule              Pods Pending ho sakte hain
+                                |
+                         Node autoscaler configured?
+                                |
+                         Cloud se naya Node maango
+```
+
+Node autoscaler configured ho toh additional machine maang sakta hai. Quota, cloud capacity, startup delay aur cost matter karte hain.
+
+## 8. Food app mein poora scenario
+
+```text
+Normal time: 3 Order Pods
+Lunch rush:  HPA load dekhta hai -> desired count 3 se 6
+             Deployment Pods banwata hai
+             Scheduler Nodes par jagah dhoondhta hai
+             Service ready Pods ko requests deti hai
+Rush khatam: HPA configured rules ke mutabik count kam kar sakta hai
+```
+
+Agar database slow ho ya payment provider down ho, Order Pods badhaane se woh bottleneck apne aap solve nahi hota. Puri request path monitor karni hoti hai.
+
+## 9. Real company examples
+
+Company architectures badal sakti hain; yeh published examples hain, har service ke baare mein universal claim nahi.
+
+### Netflix
+
+Netflix Engineering ne Docker containers aur apne **Titus** container-management platform ka use describe kiya hai. Titus container execution/resource management ko Netflix cloud infrastructure ke saath integrate karta hai. Isliye “Netflix sab kuch Kubernetes par chalata hai” kehna sahi nahi—published example mein unka apna platform hai.
+
+- [Netflix: The Evolution of Container Usage](https://netflixtechblog.com/the-evolution-of-container-usage-at-netflix-3abfc096781b)
+- [Titus project](https://netflix.github.io/titus/)
+
+**QuickBite lesson:** Docker image repeatable workload deti hai; orchestrator workload ko bahut machines par manage karta hai. Har company Kubernetes hi use kare, zaroori nahi.
+
+### Spotify
+
+Spotify Engineering ne GKE ke extensive use aur developers ke liye Kubernetes experience improve karne par likha hai. Bade organization mein shared platform/tools teams ko deploy aur troubleshoot karne mein madad karte hain.
+
+- [Spotify: Designing a Better Kubernetes Experience for Developers](https://engineering.atspotify.com/2021/3/designing-a-better-kubernetes-experience-for-developers)
+
+### Philips Hue / Signify
+
+Google Cloud case study ke mutabik Philips Hue platform GKE use karta hai aur regions mein badalte usage patterns handle karta hai—jaise Europe ki morning aur Americas ki evening activity.
+
+- [Signify / Philips Hue case study](https://cloud.google.com/customers/signify-data)
+
+**QuickBite lesson:** Alag shehron mein lunch/dinner rush alag waqt hota hai; regional demand capacity planning mein matter karti hai.
+
+## 10. Docker aur Kubernetes ka farq
+
+| | Docker | Kubernetes |
+|---|---|---|
+| Main kaam | Image banana aur container chalana | Cluster mein containerized apps manage karna |
+| Unit | Image, container | Pod; aksar Deployment se manage |
+| Sawal | “App ko same dependencies ke saath kaise pack karun?” | “Kitne Pods, kis Node par, failure/traffic par kya ho?” |
+
+## 11. Analogy aur recap
+
+- **Dockerfile** = recipe.
+- **Image** = app ka packaged blueprint.
+- **Container** = blueprint se chalta app.
+- **Pod** = Kubernetes ka deploy/manage kiya hua running unit.
+- **Deployment** = kitni copies chahiye, uska controller.
+- **Service** = requests ko available copies tak pahunchane ka stable raasta.
+- **Kubernetes** = Pods aur machines ko coordinate karne wala system.
+
+> **Recap:** Docker app ko consistent image mein pack karta hai. Kubernetes us image ko Pods mein chala kar configured recovery, networking aur scaling manage karta hai.
+
+## 12. Quick self-check
+
+1. **Image vs container?** Image blueprint; container running instance.
+2. **Pod?** Kubernetes ki smallest deployable unit; aam taur par ek main container.
+3. **Pod fail?** Controller desired replica count maintain karne ke liye replacement la sakta hai.
+4. **High traffic?** Configured metrics ke saath HPA Pod count badhata hai; Deployment replicas banata hai.
+5. **Node capacity nahi?** Pods Pending ho sakte hain; configured Node autoscaler machine add karne ki koshish karta hai.
+6. **Kubernetes bug fix karta hai?** Nahi—yeh app manage karta hai; code/database bug khud fix nahi karta.
+
+## Further reading
+
+- [Docker: Writing a Dockerfile](https://docs.docker.com/get-started/docker-concepts/building-images/writing-a-dockerfile)
+- [Kubernetes concepts](https://kubernetes.io/docs/concepts/)
+- [Kubernetes Pods](https://kubernetes.io/docs/concepts/workloads/pods/)
+- [Horizontal Pod Autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/)
+- [Node autoscaling](https://kubernetes.io/docs/concepts/cluster-administration/node-autoscaling/)
+
